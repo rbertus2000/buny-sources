@@ -4,10 +4,12 @@ use buny::{
 	Source,
 	alloc::{String, Vec, string::ToString, vec},
 	helpers::{element::ElementHelpers, uri::QueryParameters},
-	imports::{defaults::defaults_get, net::Request},
+	imports::{defaults::defaults_get, html::Document, net::Request},
 	prelude::*,
 };
 use chapter_numbers::{chapter_numbers, chapter_title};
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 pub mod traits;
 
@@ -16,6 +18,88 @@ pub mod traits;
 struct RoyalRoad;
 
 const BASE_URL: &str = "https://royalroad.com";
+
+const ANUBIS_MARKER: &str = "<script id=\"anubis_challenge\" type=\"application/json\">";
+
+#[derive(Deserialize)]
+struct AnubisPage {
+	rules: AnubisRules,
+	challenge: AnubisChallenge,
+}
+
+#[derive(Deserialize)]
+struct AnubisRules {
+	algorithm: String,
+	difficulty: usize,
+}
+
+#[derive(Deserialize)]
+struct AnubisChallenge {
+	id: String,
+	#[serde(rename = "randomData")]
+	random_data: String,
+}
+
+/// Loads a Royal Road page, getting past Anubis first if it asks.
+///
+/// Since 2026-10 the fiction lists and pages answer with an Anubis
+/// proof-of-work page (v1.28.3, algorithm "fast", difficulty 4) until the
+/// `techaro.lol-anubis-auth-*` cookie is set. The app keeps that cookie, so
+/// this only runs about once a week or after the IP changes. `/home` is not
+/// checked.
+pub(crate) fn fetch_html(url: &str) -> Result<Document> {
+	let response = Request::get(url)?.send()?;
+	let text = response.get_string()?;
+	let Some(start) = text.find(ANUBIS_MARKER) else {
+		return Ok(response.get_html()?);
+	};
+	let json = &text[start + ANUBIS_MARKER.len()..];
+	let json = &json[..json.find("</script>").unwrap_or(json.len())];
+	let page: AnubisPage =
+		serde_json::from_str(json).map_err(|_| error!("Unreadable Anubis check on Royal Road"))?;
+	// "slow" only differs in how the browser schedules the work.
+	if page.rules.algorithm != "fast" && page.rules.algorithm != "slow" {
+		return Err(error!(
+			"Royal Road asks for an unsupported Anubis check ({})",
+			page.rules.algorithm
+		));
+	}
+	let (nonce, hash) = solve_anubis(&page.challenge.random_data, page.rules.difficulty);
+
+	let mut qs = QueryParameters::new();
+	qs.push("id", Some(&page.challenge.id));
+	qs.push("response", Some(&hash));
+	qs.push("nonce", Some(&nonce.to_string()));
+	qs.push("redir", Some(url.strip_prefix(BASE_URL).unwrap_or("/")));
+	// ponytail: Anubis only logs this, so a plausible constant does.
+	qs.push("elapsedTime", Some("1000"));
+	// royalroad.com redirects to www, so the challenge and its cookies are
+	// there. This sets the auth cookie and redirects back to the page.
+	let response = Request::get(format!(
+		"https://www.royalroad.com/.within.website/x/cmd/anubis/api/pass-challenge?{qs}"
+	))?
+	.send()?;
+	if response.get_string()?.contains(ANUBIS_MARKER) {
+		return Err(error!("Royal Road's Anubis check failed. Try again later."));
+	}
+	Ok(response.get_html()?)
+}
+
+/// Finds the first nonce where SHA-256(`data` + nonce) starts with
+/// `difficulty` zero hex digits, like Anubis' worker. Returns the nonce and
+/// the hash as hex.
+fn solve_anubis(data: &str, difficulty: usize) -> (u64, String) {
+	(0u64..)
+		.find_map(|nonce| {
+			let hash = Sha256::digest(format!("{data}{nonce}"));
+			hash.iter()
+				.flat_map(|b| [b >> 4, b & 0xf])
+				.take(difficulty)
+				.all(|nibble| nibble == 0)
+				.then(|| (nonce, hash.iter().map(|b| format!("{b:02x}")).collect()))
+		})
+		.unwrap()
+}
 
 impl Source for RoyalRoad {
 	// this method is called once when the source is initialized
@@ -65,7 +149,7 @@ impl Source for RoyalRoad {
 		}
 
 		let url = format!("{}/fictions/search?{qs}", BASE_URL);
-		let html = Request::get(url)?.html()?;
+		let html = fetch_html(&url)?;
 		let entries: Vec<Novel> = html
 			.select(".fiction-list > .fiction-list-item")
 			.map(|els| {
@@ -164,7 +248,7 @@ impl Source for RoyalRoad {
 		_page: i32,
 	) -> Result<Novel> {
 		let url = format!("{}/fiction/{}", BASE_URL, novel.key);
-		let html = Request::get(&url)?.html()?;
+		let html = fetch_html(&url)?;
 		let info_div = html.select_first(".fiction-info").unwrap();
 
 		if needs_details {
@@ -290,7 +374,7 @@ impl Source for RoyalRoad {
 		chapter: Chapter,
 	) -> Result<Vec<ContentBlock>> {
 		let url = format!("{}/fiction/{}/chapter/{}", BASE_URL, novel.key, chapter.key);
-		let html = Request::get(&url)?.html()?;
+		let html = fetch_html(&url)?;
 
 		let mut content_list: Vec<ContentBlock> = html
 			.select(".chapter-content")
@@ -358,6 +442,20 @@ mod test {
 	use super::*;
 	use buny::{Home, HomeComponentValue, Listing, ListingProvider, ReviewProvider};
 	use buny_test::buny_test;
+
+	#[buny_test]
+	fn test_solve_anubis() {
+		// Reference from the browser's crypto.subtle, same loop as Anubis' worker.
+		let (nonce, hash) = solve_anubis(
+			"2c5c8a309aa79a4d1f768e455392588d3243c4b2dd7a3f229d84e196f345adf5",
+			4,
+		);
+		assert_eq!(nonce, 135045);
+		assert_eq!(
+			hash,
+			"000037696c1da01a62bc7d40ce83506e98b42e6f59bbd01d0b8962ceb60774da"
+		);
+	}
 
 	#[buny_test]
 	fn test_chapter_numbers() {

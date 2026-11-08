@@ -1,7 +1,6 @@
 use buny::{
 	Listing, ListingProvider, Novel, NovelPageResult, NovelStatus, Result,
 	alloc::{String, Vec, string::ToString},
-	imports::net::Request,
 	prelude::*,
 };
 
@@ -21,7 +20,7 @@ impl ListingProvider for RoyalRoad {
 			_ => format!("{}/fictions/best-rated?page={}", BASE_URL, page),
 		};
 
-		let html = Request::get(url)?.html()?;
+		let html = crate::fetch_html(&url)?;
 		let novels = html
 			.select(".fiction-list > .fiction-list-item")
 			.map(|els| {

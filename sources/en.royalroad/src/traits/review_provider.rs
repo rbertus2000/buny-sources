@@ -1,7 +1,5 @@
 use buny::{
-	Novel, Result, Review, ReviewPageResult, ReviewProvider,
-	alloc::Vec,
-	imports::{html::Html, net::Request},
+	Novel, Result, Review, ReviewPageResult, ReviewProvider, alloc::Vec, imports::html::Html,
 	prelude::*,
 };
 
@@ -10,7 +8,7 @@ use crate::{BASE_URL, RoyalRoad};
 impl ReviewProvider for RoyalRoad {
 	fn get_novel_reviews(&self, novel: Novel, page: i32) -> Result<ReviewPageResult> {
 		let url = format!("{}/fiction/{}?reviews={page}", BASE_URL, novel.key);
-		let html = Request::get(&url)?.html()?;
+		let html = crate::fetch_html(&url)?;
 
 		let entries = html
 			.select(".reviews-container .review")
